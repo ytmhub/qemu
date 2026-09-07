@@ -441,8 +441,8 @@ static void ivshmem_flat_class_init(ObjectClass *klass, const void *data)
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
     device_class_set_props(dc, ivshmem_flat_props);
 
-    /* Reason: Must be wired up in code (sysbus MRs and IRQ) */
-    dc->user_creatable = false;
+    /* Dynamic sysbus machines wire the MRs and IRQ through platform-bus. */
+    dc->user_creatable = true;
 }
 
 static const TypeInfo ivshmem_flat_types[] = {

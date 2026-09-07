@@ -42,6 +42,7 @@
 #include "hw/intc/riscv_aclint.h"
 #include "hw/intc/riscv_aplic.h"
 #include "hw/intc/sifive_plic.h"
+#include "hw/misc/ivshmem-flat.h"
 #include "hw/misc/sifive_test.h"
 #include "hw/platform-bus.h"
 #include "chardev/char.h"
@@ -1936,6 +1937,7 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
 
     hc->plug = virt_machine_device_plug_cb;
 
+    machine_class_allow_dynamic_sysbus_dev(mc, TYPE_IVSHMEM_FLAT);
     machine_class_allow_dynamic_sysbus_dev(mc, TYPE_RAMFB_DEVICE);
     machine_class_allow_dynamic_sysbus_dev(mc, TYPE_UEFI_VARS_SYSBUS);
 #ifdef CONFIG_TPM

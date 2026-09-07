@@ -37,6 +37,7 @@
 #include "hw/vfio/vfio-amd-xgbe.h"
 #include "hw/vfio/vfio-region.h"
 #include "hw/display/ramfb.h"
+#include "hw/misc/ivshmem-flat.h"
 #include "hw/uefi/var-service-api.h"
 #include "hw/arm/fdt.h"
 
@@ -518,6 +519,8 @@ static const BindingEntry bindings[] = {
 #ifdef CONFIG_TPM
     TYPE_BINDING(TYPE_TPM_TIS_SYSBUS, add_tpm_tis_fdt_node),
 #endif
+    /* Firmware using ivshmem-flat supplies its transport mapping itself. */
+    TYPE_BINDING(TYPE_IVSHMEM_FLAT, no_fdt_node),
     TYPE_BINDING(TYPE_RAMFB_DEVICE, no_fdt_node),
     TYPE_BINDING(TYPE_UEFI_VARS_SYSBUS, add_uefi_vars_node),
     TYPE_BINDING("", NULL), /* last element */

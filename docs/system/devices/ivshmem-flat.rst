@@ -31,3 +31,12 @@ the IRQ mechanism is disabled). The shared memory region is always present.
 The MMRs (INTRMASK, INTRSTATUS, IVPOSITION, and DOORBELL registers) offsets at
 the MMR region, and their functions, follow the ivshmem spec, so they work
 exactly as in the ivshmem PCI device (see ./specs/ivshmem-spec.txt).
+
+On the RISC-V ``virt`` machine, ``ivshmem-flat`` can be created as a dynamic
+sysbus device.  The platform bus assigns its register region, shared-memory
+region, and interrupt.  Firmware for this configuration must supply its own
+mapping; QEMU does not add an ivshmem-flat node to the generated device tree.
+For example::
+
+  -chardev socket,id=ivshmem,path=/tmp/ivshmem.sock \
+  -device ivshmem-flat,chardev=ivshmem,shmem-size=4194304
