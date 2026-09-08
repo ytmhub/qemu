@@ -1,0 +1,46 @@
+/*
+ * OCP Emulator I2C transaction bridge wire protocol.
+ *
+ * Copyright (c) 2026 OCP Emulator contributors
+ *
+ * This work is licensed under the terms of the GNU GPL, version 2 or later.
+ * See the COPYING file in the top-level directory.
+ */
+
+#ifndef HW_I2C_OCP_EMULATOR_I2C_BRIDGE_H
+#define HW_I2C_OCP_EMULATOR_I2C_BRIDGE_H
+
+#define TYPE_OCP_EMULATOR_I2C_BRIDGE "ocp-emulator-i2c-bridge"
+
+#define OCP_I2C_BRIDGE_MAGIC "OI2C"
+#define OCP_I2C_BRIDGE_VERSION 1
+#define OCP_I2C_BRIDGE_HEADER_SIZE 32
+#define OCP_I2C_BRIDGE_MAX_DATA 256
+#define OCP_I2C_BRIDGE_MAX_FRAME \
+    (OCP_I2C_BRIDGE_HEADER_SIZE + OCP_I2C_BRIDGE_MAX_DATA)
+
+#define OCP_I2C_BRIDGE_MESSAGE_REQUEST 1
+#define OCP_I2C_BRIDGE_MESSAGE_COMPLETION 2
+
+#define OCP_I2C_BRIDGE_KIND_I2C_WRITE 1
+#define OCP_I2C_BRIDGE_KIND_I2C_READ 2
+#define OCP_I2C_BRIDGE_KIND_SMBUS_BLOCK_WRITE 3
+#define OCP_I2C_BRIDGE_KIND_SMBUS_BLOCK_READ 4
+
+#define OCP_I2C_BRIDGE_FLAG_REPEATED_START (1U << 0)
+#define OCP_I2C_BRIDGE_FLAG_STOP           (1U << 1)
+#define OCP_I2C_BRIDGE_FLAG_COMMAND        (1U << 2)
+#define OCP_I2C_BRIDGE_FLAG_BYTE_COUNT     (1U << 3)
+#define OCP_I2C_BRIDGE_FLAG_PEC            (1U << 4)
+#define OCP_I2C_BRIDGE_VALID_FLAGS         0x1f
+
+#define OCP_I2C_BRIDGE_STATUS_SUCCESS      0
+#define OCP_I2C_BRIDGE_STATUS_NACK         1
+#define OCP_I2C_BRIDGE_STATUS_TIMEOUT      2
+#define OCP_I2C_BRIDGE_STATUS_UNSUPPORTED  3
+#define OCP_I2C_BRIDGE_STATUS_RESET        4
+#define OCP_I2C_BRIDGE_STATUS_MALFORMED    5
+#define OCP_I2C_BRIDGE_STATUS_OVERSIZE     6
+#define OCP_I2C_BRIDGE_STATUS_DISCONNECTED 7
+
+#endif

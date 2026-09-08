@@ -4,6 +4,8 @@
 #include "hw/qdev-core.h"
 #include "qom/object.h"
 
+#define I2C_BROADCAST 0x00
+
 /* The QEMU I2C implementation only supports simple transfers that complete
    immediately.  It does not support slave devices that need to be able to
    defer their response (eg. CPU slave interfaces where the data is supplied
@@ -147,6 +149,7 @@ void i2c_end_transfer(I2CBus *bus);
 void i2c_nack(I2CBus *bus);
 void i2c_ack(I2CBus *bus);
 void i2c_bus_master(I2CBus *bus, QEMUBH *bh);
+void i2c_cancel_pending_master(I2CBus *bus, QEMUBH *bh);
 void i2c_bus_release(I2CBus *bus);
 int i2c_send(I2CBus *bus, uint8_t data);
 int i2c_send_async(I2CBus *bus, uint8_t data);

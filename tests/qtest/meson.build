@@ -217,7 +217,8 @@ qtests_aspeed = \
   ['aspeed_gpio-test',
    'aspeed_hace-test',
    'aspeed_scu-test',
-   'aspeed_smc-test']
+   'aspeed_smc-test'] + \
+  (host_os == 'linux' ? ['aspeed_i2c-target-test'] : [])
 qtests_aspeed64 = \
   ['ast2700-gpio-test',
    'ast2700-hace-test',
@@ -368,6 +369,8 @@ endif
 
 qtests = {
   'aspeed_hace-test': files('aspeed-hace-utils.c', 'aspeed_hace-test.c'),
+  'aspeed_i2c-target-test': host_os == 'linux' ?
+                            files('qtest_aspeed.c') : [],
   'aspeed_smc-test': files('aspeed-smc-utils.c', 'aspeed_smc-test.c'),
   'ast2700-hace-test': files('aspeed-hace-utils.c', 'ast2700-hace-test.c'),
   'ast2700-smc-test': files('aspeed-smc-utils.c', 'ast2700-smc-test.c'),

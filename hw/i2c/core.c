@@ -16,8 +16,6 @@
 #include "qemu/main-loop.h"
 #include "trace.h"
 
-#define I2C_BROADCAST 0x00
-
 static const Property i2c_props[] = {
     DEFINE_PROP_UINT8("address", struct I2CSlave, address, 0),
 };
@@ -188,6 +186,20 @@ void i2c_bus_master(I2CBus *bus, QEMUBH *bh)
     node->bh = bh;
 
     QSIMPLEQ_INSERT_TAIL(&bus->pending_masters, node, entry);
+}
+
+void i2c_cancel_pending_master(I2CBus *bus, QEMUBH *bh)
+{
+    I2CPendingMaster *node;
+    I2CPendingMaster *next;
+
+    QSIMPLEQ_FOREACH_SAFE(node, &bus->pending_masters, entry, next) {
+        if (node->bh == bh) {
+            QSIMPLEQ_REMOVE(&bus->pending_masters, node,
+                            I2CPendingMaster, entry);
+            g_free(node);
+        }
+    }
 }
 
 void i2c_schedule_pending_master(I2CBus *bus)
