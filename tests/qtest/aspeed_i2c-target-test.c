@@ -46,7 +46,13 @@
 #define I2CD_M_START_CMD BIT(0)
 
 #define TEST_TIMEOUT_MS 5000
+#define TEST_SOURCE_TIMEOUT_MS 1000
 
+static const uint8_t test_token_nonce[OCP_I2C_BRIDGE_TOKEN_NONCE_SIZE] = {
+    0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe,
+    0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+};
+static const uint8_t zero_token[OCP_I2C_BRIDGE_TOKEN_SIZE];
 static unsigned int socket_sequence;
 
 typedef struct BridgeFixture {
@@ -71,6 +77,15 @@ static void put_be32(uint8_t *p, uint32_t value)
     p[3] = value;
 }
 
+static void put_be64(uint8_t *p, uint64_t value)
+{
+    unsigned int i;
+
+    for (i = 0; i < 8; i++) {
+        p[i] = value >> (56 - i * 8);
+    }
+}
+
 static uint16_t get_be16(const uint8_t *p)
 {
     return ((uint16_t)p[0] << 8) | p[1];
@@ -80,6 +95,11 @@ static uint32_t get_be32(const uint8_t *p)
 {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
            ((uint32_t)p[2] << 8) | p[3];
+}
+
+static uint64_t get_be64(const uint8_t *p)
+{
+    return ((uint64_t)get_be32(p) << 32) | get_be32(p + 4);
 }
 
 static int wait_for_fd(int fd, short events, int timeout_ms)
@@ -167,6 +187,9 @@ static size_t make_request(uint8_t *packet, uint32_t transaction_id,
     packet[20] = address;
     put_be32(packet + 24, timeout_ms);
     put_be16(packet + 28, payload_length);
+    memcpy(packet + OCP_I2C_BRIDGE_TOKEN_NONCE_OFFSET, test_token_nonce,
+           sizeof(test_token_nonce));
+    put_be64(packet + OCP_I2C_BRIDGE_TOKEN_COUNTER_OFFSET, transaction_id);
     if (payload_length) {
         memcpy(packet + OCP_I2C_BRIDGE_HEADER_SIZE, payload, payload_length);
     }
@@ -186,7 +209,7 @@ static void make_completion(uint8_t *packet, uint32_t transaction_id,
     put_be32(packet + 12, transaction_id);
     put_be32(packet + 16, TEST_INITIATOR_ID);
     packet[20] = address;
-    put_be32(packet + 24, TEST_TIMEOUT_MS);
+    put_be32(packet + 24, TEST_SOURCE_TIMEOUT_MS);
     packet[30] = status;
 }
 
@@ -212,8 +235,19 @@ static size_t receive_frame(int fd, uint8_t *packet, size_t capacity)
     return ret;
 }
 
-static void assert_completion(int fd, uint32_t transaction_id,
-                              uint32_t initiator_id, uint8_t status)
+static void reconnect_after_disconnect(BridgeFixture *f)
+{
+    g_assert_cmpint(wait_for_fd(f->peer_fd, POLLHUP, TEST_TIMEOUT_MS) & POLLHUP,
+                    !=, 0);
+    close(f->peer_fd);
+    f->peer_fd = accept_peer(f->listener_fd);
+    g_assert_cmpint(wait_for_fd(f->peer_fd, POLLIN, 200), ==, 0);
+}
+
+static void assert_completion_counter(int fd, uint32_t transaction_id,
+                                      uint32_t initiator_id, uint8_t status,
+                                      uint64_t token_counter,
+                                      uint32_t timeout_ms)
 {
     uint8_t packet[OCP_I2C_BRIDGE_MAX_FRAME];
     size_t length = receive_frame(fd, packet, sizeof(packet));
@@ -224,8 +258,26 @@ static void assert_completion(int fd, uint32_t transaction_id,
     g_assert_cmpuint(packet[5], ==, OCP_I2C_BRIDGE_MESSAGE_COMPLETION);
     g_assert_cmpuint(get_be32(packet + 12), ==, transaction_id);
     g_assert_cmpuint(get_be32(packet + 16), ==, initiator_id);
+    g_assert_cmpuint(get_be32(packet + 24), ==, timeout_ms);
     g_assert_cmpuint(get_be16(packet + 28), ==, 0);
     g_assert_cmpuint(packet[30], ==, status);
+    if (transaction_id == 0) {
+        g_assert_cmpmem(packet + OCP_I2C_BRIDGE_TOKEN_NONCE_OFFSET,
+                        sizeof(zero_token), zero_token, sizeof(zero_token));
+    } else {
+        g_assert_cmpmem(packet + OCP_I2C_BRIDGE_TOKEN_NONCE_OFFSET,
+                        sizeof(test_token_nonce), test_token_nonce,
+                        sizeof(test_token_nonce));
+        g_assert_cmpuint(get_be64(packet + OCP_I2C_BRIDGE_TOKEN_COUNTER_OFFSET),
+                         ==, token_counter);
+    }
+}
+
+static void assert_completion(int fd, uint32_t transaction_id,
+                              uint32_t initiator_id, uint8_t status)
+{
+    assert_completion_counter(fd, transaction_id, initiator_id, status,
+                              transaction_id, TEST_TIMEOUT_MS);
 }
 
 static uint32_t wait_for_status(BridgeFixture *f, uint32_t mask)
@@ -311,6 +363,8 @@ static void test_outbound_controller(BridgeFixture *f, gconstpointer data)
     g_assert_cmpuint(get_be32(packet + 16), ==, TEST_INITIATOR_ID);
     g_assert_cmpuint(packet[20], ==, TEST_BRIDGE_ADDRESS);
     g_assert_cmpuint(get_be16(packet + 28), ==, sizeof(expected));
+    g_assert_cmpmem(packet + OCP_I2C_BRIDGE_TOKEN_NONCE_OFFSET,
+                    sizeof(zero_token), zero_token, sizeof(zero_token));
     g_assert_cmpmem(packet + OCP_I2C_BRIDGE_HEADER_SIZE, sizeof(expected),
                     expected, sizeof(expected));
 
@@ -338,7 +392,12 @@ static void test_outbound_controller(BridgeFixture *f, gconstpointer data)
 
     make_completion(packet, transaction_id + 1, TEST_BRIDGE_ADDRESS,
                     OCP_I2C_BRIDGE_STATUS_SUCCESS);
+    memcpy(packet + OCP_I2C_BRIDGE_TOKEN_NONCE_OFFSET, test_token_nonce,
+           sizeof(test_token_nonce));
+    put_be64(packet + OCP_I2C_BRIDGE_TOKEN_COUNTER_OFFSET, 1);
     send_frame(f->peer_fd, packet, OCP_I2C_BRIDGE_HEADER_SIZE);
+    qtest_clock_step(f->qts, 1);
+    reconnect_after_disconnect(f);
 }
 
 static void test_outbound_general_call_ignored(BridgeFixture *f,
@@ -477,8 +536,8 @@ static void test_maximum_and_oversize(BridgeFixture *f, gconstpointer data)
                           sizeof(payload), 10000);
     send_frame(f->peer_fd, packet, length);
     receive_target_write(f, payload, sizeof(payload));
-    assert_completion(f->peer_fd, 3, TEST_REMOTE_INITIATOR_ID,
-                      OCP_I2C_BRIDGE_STATUS_SUCCESS);
+    assert_completion_counter(f->peer_fd, 3, TEST_REMOTE_INITIATOR_ID,
+                              OCP_I2C_BRIDGE_STATUS_SUCCESS, 3, 10000);
 
     length = make_request(packet, 4, TEST_TARGET_ADDRESS, payload,
                           sizeof(payload), TEST_TIMEOUT_MS);
@@ -516,14 +575,44 @@ static void test_malformed_frame(BridgeFixture *f, gconstpointer data)
     size_t length;
 
     send_frame(f->peer_fd, malformed, sizeof(malformed));
-    assert_completion(f->peer_fd, 0, 0,
-                      OCP_I2C_BRIDGE_STATUS_MALFORMED);
+    reconnect_after_disconnect(f);
 
     length = make_request(packet, 8, TEST_GENERAL_CALL_ADDRESS, &payload, 1,
                           TEST_TIMEOUT_MS);
     send_frame(f->peer_fd, packet, length);
     assert_completion(f->peer_fd, 8, TEST_REMOTE_INITIATOR_ID,
                       OCP_I2C_BRIDGE_STATUS_UNSUPPORTED);
+}
+
+static void test_malformed_tokens(BridgeFixture *f, gconstpointer data)
+{
+    const uint8_t payload = 0xaa;
+    uint8_t packet[OCP_I2C_BRIDGE_MAX_FRAME];
+    size_t length;
+
+    length = make_request(packet, 9, TEST_TARGET_ADDRESS, &payload, 1,
+                          TEST_TIMEOUT_MS);
+    memset(packet + OCP_I2C_BRIDGE_TOKEN_NONCE_OFFSET, 0,
+           OCP_I2C_BRIDGE_TOKEN_NONCE_SIZE);
+    send_frame(f->peer_fd, packet, length);
+    reconnect_after_disconnect(f);
+
+    length = make_request(packet, 10, TEST_TARGET_ADDRESS, &payload, 1,
+                          TEST_TIMEOUT_MS);
+    memset(packet + OCP_I2C_BRIDGE_TOKEN_COUNTER_OFFSET, 0, 8);
+    send_frame(f->peer_fd, packet, length);
+    reconnect_after_disconnect(f);
+
+    length = make_request(packet, 11, TEST_TARGET_ADDRESS, &payload, 1,
+                          TEST_TIMEOUT_MS);
+    packet[4] = 1;
+    send_frame(f->peer_fd, packet, length);
+    reconnect_after_disconnect(f);
+
+    length = make_request(packet, 12, TEST_TARGET_ADDRESS, &payload, 1,
+                          TEST_TIMEOUT_MS);
+    send_frame(f->peer_fd, packet, OCP_I2C_BRIDGE_HEADER_SIZE - 1);
+    reconnect_after_disconnect(f);
 }
 
 static void test_disconnect_reconnect(BridgeFixture *f, gconstpointer data)
@@ -539,15 +628,116 @@ static void test_disconnect_reconnect(BridgeFixture *f, gconstpointer data)
     wait_for_status(f, I2CD_INTR_RX_DONE |
                        I2CD_INTR_SLAVE_ADDR_RX_MATCH);
 
+    /* Queue/advance an ACK callback immediately before dropping its owner. */
+    qtest_writel(f->qts, f->base + I2CD_INTR_STS, I2CD_INTR_RX_DONE);
     close(f->peer_fd);
     f->peer_fd = accept_peer(f->listener_fd);
     g_assert_cmpint(wait_for_fd(f->peer_fd, POLLIN, 200), ==, 0);
 
-    length = make_request(packet, 7, TEST_TARGET_ADDRESS + 1, payload,
+    qtest_writel(f->qts, f->base + I2CD_INTR_STS, UINT32_MAX);
+    length = make_request(packet, 6, TEST_TARGET_ADDRESS, payload,
                           sizeof(payload), TEST_TIMEOUT_MS);
+    put_be64(packet + OCP_I2C_BRIDGE_TOKEN_COUNTER_OFFSET, 7);
     send_frame(f->peer_fd, packet, length);
-    assert_completion(f->peer_fd, 7, TEST_REMOTE_INITIATOR_ID,
-                      OCP_I2C_BRIDGE_STATUS_NACK);
+    receive_target_write(f, payload, sizeof(payload));
+    assert_completion_counter(f->peer_fd, 6, TEST_REMOTE_INITIATOR_ID,
+                              OCP_I2C_BRIDGE_STATUS_SUCCESS, 7,
+                              TEST_TIMEOUT_MS);
+    g_assert_cmpint(wait_for_fd(f->peer_fd, POLLIN, 200), ==, 0);
+}
+
+static void test_disconnect_queued_master(BridgeFixture *f, gconstpointer data)
+{
+    const uint8_t payload[] = { 0x51, 0x52 };
+    uint8_t packet[OCP_I2C_BRIDGE_MAX_FRAME];
+    size_t length;
+
+    configure_target(f);
+    qtest_writel(f->qts, f->base + I2CD_INTR_CTRL,
+                 I2CD_INTR_TX_ACK | I2CD_INTR_TX_NAK | I2CD_INTR_RX_DONE |
+                 I2CD_INTR_NORMAL_STOP);
+    qtest_writel(f->qts, f->base + I2CD_FUN_CTRL,
+                 I2CD_MASTER_EN | I2CD_SLAVE_EN);
+    qtest_writel(f->qts, f->base + I2CD_BYTE_BUF, TEST_BRIDGE_ADDRESS << 1);
+    qtest_writel(f->qts, f->base + I2CD_CMD,
+                 I2CD_M_START_CMD | I2CD_M_TX_CMD);
+    wait_for_status(f, I2CD_INTR_TX_ACK);
+
+    /* The guest owns the bus; A must wait in pending_masters, not start. */
+    length = make_request(packet, 44, TEST_TARGET_ADDRESS, payload,
+                          sizeof(payload), TEST_TIMEOUT_MS);
+    put_be64(packet + OCP_I2C_BRIDGE_TOKEN_COUNTER_OFFSET, 300);
+    send_frame(f->peer_fd, packet, length);
+    g_assert_cmpint(wait_for_fd(f->peer_fd, POLLIN, 100), ==, 0);
+    close(f->peer_fd);
+    f->peer_fd = accept_peer(f->listener_fd);
+    qtest_writel(f->qts, f->base + I2CD_INTR_STS, UINT32_MAX);
+    qtest_writel(f->qts, f->base + I2CD_CMD, I2CD_M_STOP_CMD);
+    g_usleep(20000);
+    g_assert_cmphex(qtest_readl(f->qts, f->base + I2CD_INTR_STS) &
+                    I2CD_INTR_RX_DONE, ==, 0);
+    g_assert_cmpint(wait_for_fd(f->peer_fd, POLLIN, 100), ==, 0);
+
+    /* After release, only new work with B's token may be delivered. */
+    qtest_writel(f->qts, f->base + I2CD_INTR_STS, UINT32_MAX);
+    put_be64(packet + OCP_I2C_BRIDGE_TOKEN_COUNTER_OFFSET, 301);
+    send_frame(f->peer_fd, packet, length);
+    receive_target_write(f, payload, sizeof(payload));
+    assert_completion_counter(f->peer_fd, 44, TEST_REMOTE_INITIATOR_ID,
+                              OCP_I2C_BRIDGE_STATUS_SUCCESS, 301,
+                              TEST_TIMEOUT_MS);
+}
+
+static void test_busy_keeps_original_token(BridgeFixture *f, gconstpointer data)
+{
+    const uint8_t payload[] = { 0x31, 0x32 };
+    uint8_t packet[OCP_I2C_BRIDGE_MAX_FRAME];
+    size_t length;
+
+    configure_target(f);
+    length = make_request(packet, 42, TEST_TARGET_ADDRESS, payload,
+                          sizeof(payload), TEST_TIMEOUT_MS);
+    put_be64(packet + OCP_I2C_BRIDGE_TOKEN_COUNTER_OFFSET, 100);
+    send_frame(f->peer_fd, packet, length);
+    wait_for_status(f, I2CD_INTR_RX_DONE | I2CD_INTR_SLAVE_ADDR_RX_MATCH);
+
+    /* A rejected newer dispatch must not replace A's callback identity. */
+    put_be64(packet + OCP_I2C_BRIDGE_TOKEN_COUNTER_OFFSET, 101);
+    send_frame(f->peer_fd, packet, length);
+    assert_completion_counter(f->peer_fd, 42, TEST_REMOTE_INITIATOR_ID,
+                              OCP_I2C_BRIDGE_STATUS_UNSUPPORTED, 101,
+                              TEST_TIMEOUT_MS);
+    receive_target_write(f, payload, sizeof(payload));
+    assert_completion_counter(f->peer_fd, 42, TEST_REMOTE_INITIATOR_ID,
+                              OCP_I2C_BRIDGE_STATUS_SUCCESS, 100,
+                              TEST_TIMEOUT_MS);
+    g_assert_cmpint(wait_for_fd(f->peer_fd, POLLIN, 100), ==, 0);
+}
+
+static void test_timeout_keeps_original_token(BridgeFixture *f, gconstpointer data)
+{
+    const uint8_t payload[] = { 0x41, 0x42 };
+    uint8_t packet[OCP_I2C_BRIDGE_MAX_FRAME];
+    size_t length;
+
+    configure_target(f);
+    length = make_request(packet, 43, TEST_TARGET_ADDRESS, payload,
+                          sizeof(payload), 25);
+    put_be64(packet + OCP_I2C_BRIDGE_TOKEN_COUNTER_OFFSET, 200);
+    send_frame(f->peer_fd, packet, length);
+    /* Leave RX unacknowledged until the actual host timer completes A. */
+    assert_completion_counter(f->peer_fd, 43, TEST_REMOTE_INITIATOR_ID,
+                              OCP_I2C_BRIDGE_STATUS_TIMEOUT, 200, 25);
+    qtest_writel(f->qts, f->base + I2CD_INTR_STS, UINT32_MAX);
+    length = make_request(packet, 43, TEST_TARGET_ADDRESS, payload,
+                          sizeof(payload), TEST_TIMEOUT_MS);
+    put_be64(packet + OCP_I2C_BRIDGE_TOKEN_COUNTER_OFFSET, 201);
+    send_frame(f->peer_fd, packet, length);
+    receive_target_write(f, payload, sizeof(payload));
+    assert_completion_counter(f->peer_fd, 43, TEST_REMOTE_INITIATOR_ID,
+                              OCP_I2C_BRIDGE_STATUS_SUCCESS, 201,
+                              TEST_TIMEOUT_MS);
+    g_assert_cmpint(wait_for_fd(f->peer_fd, POLLIN, 100), ==, 0);
 }
 
 int main(int argc, char **argv)
@@ -577,8 +767,19 @@ int main(int argc, char **argv)
                fixture_teardown);
     g_test_add("/ast2600/i2c/bridge/malformed-frame", BridgeFixture,
                NULL, fixture_setup, test_malformed_frame, fixture_teardown);
+    g_test_add("/ast2600/i2c/bridge/malformed-tokens", BridgeFixture,
+               NULL, fixture_setup, test_malformed_tokens, fixture_teardown);
     g_test_add("/ast2600/i2c/bridge/disconnect-reconnect", BridgeFixture,
                NULL, fixture_setup, test_disconnect_reconnect,
+               fixture_teardown);
+    g_test_add("/ast2600/i2c/bridge/busy-keeps-original-token", BridgeFixture,
+               NULL, fixture_setup, test_busy_keeps_original_token,
+               fixture_teardown);
+    g_test_add("/ast2600/i2c/bridge/timeout-keeps-original-token", BridgeFixture,
+               NULL, fixture_setup, test_timeout_keeps_original_token,
+               fixture_teardown);
+    g_test_add("/ast2600/i2c/bridge/disconnect-queued-master", BridgeFixture,
+               NULL, fixture_setup, test_disconnect_queued_master,
                fixture_teardown);
     return g_test_run();
 }

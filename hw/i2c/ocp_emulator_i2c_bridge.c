@@ -35,6 +35,14 @@ typedef enum BridgeInjectPhase {
     BRIDGE_INJECT_SEND,
 } BridgeInjectPhase;
 
+typedef struct BridgeDispatchIdentity {
+    uint32_t transaction_id;
+    uint32_t initiator_id;
+    uint32_t timeout_ms;
+    uint8_t address;
+    uint8_t token[OCP_I2C_BRIDGE_TOKEN_SIZE];
+} BridgeDispatchIdentity;
+
 struct OcpEmulatorI2CBridge {
     I2CSlave parent_obj;
 
@@ -50,12 +58,16 @@ struct OcpEmulatorI2CBridge {
     QEMUBH *inject_bh;
 
     BridgeInjectPhase inject_phase;
-    uint32_t inject_transaction_id;
-    uint32_t inject_initiator_id;
-    uint8_t inject_address;
     uint16_t inject_length;
     uint16_t inject_position;
     uint8_t inject_data[OCP_I2C_BRIDGE_MAX_DATA];
+    /*
+     * Owned by the sole active injection, never replaced while it is active.
+     * BH/timer callbacks are serialized progress notifications, not cached
+     * results. Teardown cancels both and removes pending bus ownership before
+     * a new injection can reuse this state; finish snapshots identity first.
+     */
+    BridgeDispatchIdentity inject_identity;
 
     bool outbound_active;
     bool outbound_oversize;
@@ -92,6 +104,18 @@ static void bridge_put_be32(uint8_t *p, uint32_t value)
     p[3] = value;
 }
 
+static bool bridge_bytes_nonzero(const uint8_t *bytes, size_t length)
+{
+    size_t i;
+
+    for (i = 0; i < length; i++) {
+        if (bytes[i] != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void bridge_schedule_reconnect(OcpEmulatorI2CBridge *s)
 {
     if (s->socket_path && s->reconnect_timer) {
@@ -103,6 +127,7 @@ static void bridge_schedule_reconnect(OcpEmulatorI2CBridge *s)
 
 static void bridge_release_injection_master(OcpEmulatorI2CBridge *s)
 {
+    qemu_bh_cancel(s->inject_bh);
     if (s->bus->bh == s->inject_bh) {
         if (i2c_bus_busy(s->bus)) {
             i2c_end_transfer(s->bus);
@@ -162,8 +187,8 @@ static bool bridge_send_packet(OcpEmulatorI2CBridge *s,
 }
 
 static void bridge_init_header(OcpEmulatorI2CBridge *s, uint8_t *packet,
-                               uint8_t message_type, uint32_t transaction_id,
-                               uint32_t initiator_id, uint8_t address,
+                               uint8_t message_type,
+                               const BridgeDispatchIdentity *identity,
                                uint16_t length, uint8_t status)
 {
     memset(packet, 0, OCP_I2C_BRIDGE_HEADER_SIZE);
@@ -173,38 +198,37 @@ static void bridge_init_header(OcpEmulatorI2CBridge *s, uint8_t *packet,
     packet[6] = OCP_I2C_BRIDGE_KIND_I2C_WRITE;
     packet[7] = OCP_I2C_BRIDGE_FLAG_STOP;
     bridge_put_be32(packet + 8, s->bus_id);
-    bridge_put_be32(packet + 12, transaction_id);
-    bridge_put_be32(packet + 16, initiator_id);
-    packet[20] = address;
-    bridge_put_be32(packet + 24, BRIDGE_DEFAULT_TIMEOUT_MS);
+    bridge_put_be32(packet + 12, identity->transaction_id);
+    bridge_put_be32(packet + 16, identity->initiator_id);
+    packet[20] = identity->address;
+    bridge_put_be32(packet + 24, identity->timeout_ms);
     bridge_put_be16(packet + 28, length);
     packet[30] = status;
+    memcpy(packet + OCP_I2C_BRIDGE_TOKEN_NONCE_OFFSET, identity->token,
+           sizeof(identity->token));
 }
 
 static void bridge_send_completion(OcpEmulatorI2CBridge *s,
-                                   uint32_t transaction_id,
-                                   uint32_t initiator_id, uint8_t address,
+                                   const BridgeDispatchIdentity *identity,
                                    uint8_t status)
 {
     uint8_t packet[OCP_I2C_BRIDGE_HEADER_SIZE];
 
     bridge_init_header(s, packet, OCP_I2C_BRIDGE_MESSAGE_COMPLETION,
-                       transaction_id, initiator_id, address, 0, status);
+                       identity, 0, status);
     bridge_send_packet(s, packet, sizeof(packet));
 }
 
 static void bridge_finish_injection(OcpEmulatorI2CBridge *s, uint8_t status)
 {
-    uint32_t transaction_id = s->inject_transaction_id;
-    uint32_t initiator_id = s->inject_initiator_id;
-    uint8_t address = s->inject_address;
+    const BridgeDispatchIdentity identity = s->inject_identity;
 
     timer_del(s->transaction_timer);
     bridge_release_injection_master(s);
     s->inject_phase = BRIDGE_INJECT_IDLE;
     s->inject_length = 0;
     s->inject_position = 0;
-    bridge_send_completion(s, transaction_id, initiator_id, address, status);
+    bridge_send_completion(s, &identity, status);
 }
 
 static void bridge_inject_bh(void *opaque)
@@ -219,7 +243,7 @@ static void bridge_inject_bh(void *opaque)
     }
 
     if (s->inject_phase == BRIDGE_INJECT_WAIT_START) {
-        if (i2c_start_send_async(s->bus, s->inject_address)) {
+        if (i2c_start_send_async(s->bus, s->inject_identity.address)) {
             bridge_finish_injection(s, OCP_I2C_BRIDGE_STATUS_NACK);
             return;
         }
@@ -250,18 +274,24 @@ static void bridge_transaction_timeout(void *opaque)
 
 static uint8_t bridge_validate_request(OcpEmulatorI2CBridge *s,
                                        const uint8_t *packet, size_t length,
-                                       uint32_t *transaction_id,
-                                       uint32_t *initiator_id,
-                                       uint8_t *address, uint16_t *data_length,
-                                       uint32_t *timeout_ms)
+                                       BridgeDispatchIdentity *identity,
+                                       uint16_t *data_length,
+                                       bool *fatal)
 {
     uint8_t flags;
 
-    *transaction_id = length >= 16 ? bridge_get_be32(packet + 12) : 0;
-    *initiator_id = length >= 20 ? bridge_get_be32(packet + 16) : 0;
-    *address = length >= 21 ? packet[20] : 0;
+    *identity = (BridgeDispatchIdentity) {
+        .transaction_id = length >= 16 ? bridge_get_be32(packet + 12) : 0,
+        .initiator_id = length >= 20 ? bridge_get_be32(packet + 16) : 0,
+        .address = length >= 21 ? packet[20] : 0,
+        .timeout_ms = BRIDGE_DEFAULT_TIMEOUT_MS,
+    };
     *data_length = 0;
-    *timeout_ms = BRIDGE_DEFAULT_TIMEOUT_MS;
+    *fatal = true;
+    if (length >= OCP_I2C_BRIDGE_HEADER_SIZE) {
+        memcpy(identity->token, packet + OCP_I2C_BRIDGE_TOKEN_NONCE_OFFSET,
+               sizeof(identity->token));
+    }
 
     if (length < OCP_I2C_BRIDGE_HEADER_SIZE ||
         memcmp(packet, OCP_I2C_BRIDGE_MAGIC, 4) != 0 ||
@@ -270,8 +300,16 @@ static uint8_t bridge_validate_request(OcpEmulatorI2CBridge *s,
         return OCP_I2C_BRIDGE_STATUS_MALFORMED;
     }
 
+    if (!bridge_bytes_nonzero(identity->token,
+                              OCP_I2C_BRIDGE_TOKEN_NONCE_SIZE) ||
+        !bridge_bytes_nonzero(identity->token + OCP_I2C_BRIDGE_TOKEN_NONCE_SIZE,
+                              8)) {
+        return OCP_I2C_BRIDGE_STATUS_MALFORMED;
+    }
+    *fatal = false;
+
     *data_length = bridge_get_be16(packet + 28);
-    *timeout_ms = bridge_get_be32(packet + 24);
+    identity->timeout_ms = bridge_get_be32(packet + 24);
     if (*data_length > OCP_I2C_BRIDGE_MAX_DATA ||
         length > OCP_I2C_BRIDGE_MAX_FRAME) {
         return OCP_I2C_BRIDGE_STATUS_OVERSIZE;
@@ -283,13 +321,14 @@ static uint8_t bridge_validate_request(OcpEmulatorI2CBridge *s,
     }
 
     flags = packet[7];
-    if (*address == I2C_BROADCAST ||
+    if (identity->address == I2C_BROADCAST ||
         packet[6] != OCP_I2C_BRIDGE_KIND_I2C_WRITE ||
         flags != OCP_I2C_BRIDGE_FLAG_STOP || packet[21] != 0 ||
         packet[22] != 0 || packet[23] != 0) {
         return OCP_I2C_BRIDGE_STATUS_UNSUPPORTED;
     }
-    if (*timeout_ms == 0 || *timeout_ms > BRIDGE_MAX_TIMEOUT_MS) {
+    if (identity->timeout_ms == 0 ||
+        identity->timeout_ms > BRIDGE_MAX_TIMEOUT_MS) {
         return OCP_I2C_BRIDGE_STATUS_UNSUPPORTED;
     }
     return OCP_I2C_BRIDGE_STATUS_SUCCESS;
@@ -310,8 +349,11 @@ static bool bridge_handle_completion(OcpEmulatorI2CBridge *s,
         bridge_get_be32(packet + 16) != s->initiator_id ||
         packet[20] != s->outbound_address || packet[21] != 0 ||
         packet[22] != 0 || packet[23] != 0 ||
+        bridge_get_be32(packet + 24) != BRIDGE_DEFAULT_TIMEOUT_MS ||
         bridge_get_be16(packet + 28) != 0 ||
-        packet[30] > OCP_I2C_BRIDGE_STATUS_DISCONNECTED || packet[31] != 0) {
+        packet[30] > OCP_I2C_BRIDGE_STATUS_DISCONNECTED || packet[31] != 0 ||
+        bridge_bytes_nonzero(packet + OCP_I2C_BRIDGE_TOKEN_NONCE_OFFSET,
+                             OCP_I2C_BRIDGE_TOKEN_SIZE)) {
         return false;
     }
 
@@ -333,9 +375,10 @@ static void bridge_socket_read(void *opaque)
 {
     OcpEmulatorI2CBridge *s = opaque;
     uint8_t packet[OCP_I2C_BRIDGE_MAX_FRAME + 1];
-    uint32_t transaction_id, initiator_id, timeout_ms;
+    BridgeDispatchIdentity identity;
     uint16_t data_length;
-    uint8_t address, status;
+    uint8_t status;
+    bool fatal;
     ssize_t length;
 
     do {
@@ -359,29 +402,28 @@ static void bridge_socket_read(void *opaque)
         return;
     }
 
-    status = bridge_validate_request(s, packet, length, &transaction_id,
-                                     &initiator_id, &address, &data_length,
-                                     &timeout_ms);
+    status = bridge_validate_request(s, packet, length, &identity,
+                                     &data_length, &fatal);
     if (status != OCP_I2C_BRIDGE_STATUS_SUCCESS) {
-        bridge_send_completion(s, transaction_id, initiator_id, address,
-                               status);
+        if (fatal) {
+            bridge_disconnect(s);
+        } else {
+            bridge_send_completion(s, &identity, status);
+        }
         return;
     }
     if (s->inject_phase != BRIDGE_INJECT_IDLE) {
-        bridge_send_completion(s, transaction_id, initiator_id, address,
-                               OCP_I2C_BRIDGE_STATUS_UNSUPPORTED);
+        bridge_send_completion(s, &identity, OCP_I2C_BRIDGE_STATUS_UNSUPPORTED);
         return;
     }
 
-    s->inject_transaction_id = transaction_id;
-    s->inject_initiator_id = initiator_id;
-    s->inject_address = address;
+    s->inject_identity = identity;
     s->inject_length = data_length;
     s->inject_position = 0;
     memcpy(s->inject_data, packet + OCP_I2C_BRIDGE_HEADER_SIZE, data_length);
     s->inject_phase = BRIDGE_INJECT_WAIT_START;
     timer_mod(s->transaction_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + timeout_ms);
+              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + identity.timeout_ms);
     i2c_bus_master(s->bus, s->inject_bh);
     i2c_schedule_pending_master(s->bus);
 }
@@ -440,7 +482,7 @@ static int bridge_i2c_event(I2CSlave *slave, enum i2c_event event)
 {
     OcpEmulatorI2CBridge *s = OCP_EMULATOR_I2C_BRIDGE(slave);
     uint8_t packet[OCP_I2C_BRIDGE_MAX_FRAME];
-    uint32_t transaction_id;
+    BridgeDispatchIdentity identity;
     bool sent;
 
     switch (event) {
@@ -475,14 +517,18 @@ static int bridge_i2c_event(I2CSlave *slave, enum i2c_event event)
             s->outbound_length = 0;
             return 0;
         }
-        transaction_id = ++s->next_transaction_id;
+        identity = (BridgeDispatchIdentity) {
+            .transaction_id = ++s->next_transaction_id,
+            .initiator_id = s->initiator_id,
+            .address = slave->address,
+            .timeout_ms = BRIDGE_DEFAULT_TIMEOUT_MS,
+        };
         bridge_init_header(s, packet, OCP_I2C_BRIDGE_MESSAGE_REQUEST,
-                           transaction_id, s->initiator_id, slave->address,
-                           s->outbound_length,
+                           &identity, s->outbound_length,
                            OCP_I2C_BRIDGE_STATUS_SUCCESS);
         memcpy(packet + OCP_I2C_BRIDGE_HEADER_SIZE, s->outbound_data,
                s->outbound_length);
-        s->outbound_transaction_id = transaction_id;
+        s->outbound_transaction_id = identity.transaction_id;
         s->outbound_address = slave->address;
         s->outbound_waiting_completion = true;
         timer_mod(s->outbound_timer,
@@ -525,17 +571,7 @@ static void bridge_reset(DeviceState *dev)
     OcpEmulatorI2CBridge *s = OCP_EMULATOR_I2C_BRIDGE(dev);
 
     if (s->inject_phase != BRIDGE_INJECT_IDLE) {
-        uint32_t transaction_id = s->inject_transaction_id;
-        uint32_t initiator_id = s->inject_initiator_id;
-        uint8_t address = s->inject_address;
-
-        timer_del(s->transaction_timer);
-        bridge_release_injection_master(s);
-        s->inject_phase = BRIDGE_INJECT_IDLE;
-        s->inject_length = 0;
-        s->inject_position = 0;
-        bridge_send_completion(s, transaction_id, initiator_id, address,
-                               OCP_I2C_BRIDGE_STATUS_RESET);
+        bridge_finish_injection(s, OCP_I2C_BRIDGE_STATUS_RESET);
     }
     s->outbound_active = false;
     timer_del(s->outbound_timer);
