@@ -74,6 +74,7 @@ typedef struct {
 #define VFIO_USER_CAP_MAP_MAX   "max_dma_maps"
 #define VFIO_USER_CAP_MIGR      "migration"
 #define VFIO_USER_CAP_MULTI     "write_multiple"
+#define VFIO_USER_CAP_IRQ_CLEAR "x-msix-clear-pending"
 
 /* "migration" members */
 #define VFIO_USER_CAP_PGSIZE            "pgsize"

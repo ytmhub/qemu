@@ -55,6 +55,9 @@ enum proxy_state {
 typedef QTAILQ_HEAD(VFIOUserMsgQ, VFIOUserMsg) VFIOUserMsgQ;
 
 typedef struct VFIOUserProxy {
+    /* Optional, separately negotiated pending-MSI-X cancellation channel. */
+    int irq_clear_fd;
+    bool irq_clear_supported;
     QLIST_ENTRY(VFIOUserProxy) next;
     char *sockname;
     struct QIOChannel *ioc;

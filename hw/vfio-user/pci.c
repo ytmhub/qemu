@@ -10,6 +10,8 @@
 #include "qemu/osdep.h"
 #include "qapi-visit-sockets.h"
 #include "qemu/error-report.h"
+#include "qemu/range.h"
+#include "hw/pci/msix.h"
 
 #include "hw/qdev-properties.h"
 #include "hw/vfio/pci.h"
@@ -25,7 +27,76 @@ struct VFIOUserPCIDevice {
     bool send_queued;   /* all sends are queued */
     uint32_t wait_time; /* timeout for message replies */
     bool no_post;       /* all region writes are sync */
+    int irq_clear_fd;
+    uint64_t irq_clear_serial;
 };
+
+static void vfio_user_irq_clear_close(VFIOUserPCIDevice *udev)
+{
+    if (udev->irq_clear_fd >= 0) {
+        qemu_set_fd_handler(udev->irq_clear_fd, NULL, NULL, NULL);
+        close(udev->irq_clear_fd);
+        udev->irq_clear_fd = -1;
+    }
+}
+
+static void vfio_user_clear_pending_vectors(VFIOPCIDevice *vdev)
+{
+    unsigned i;
+
+    if (vdev->interrupt == VFIO_INT_MSIX) {
+        for (i = 0; i < vdev->nr_vectors; i++) {
+            VFIOMSIVector *vector = &vdev->msi_vectors[i];
+            if (vector->use) {
+                event_notifier_test_and_clear(&vector->interrupt);
+                if (vector->virq >= 0) {
+                    event_notifier_test_and_clear(&vector->kvm_interrupt);
+                }
+            }
+        }
+    }
+    if (vdev->msix) {
+        for (i = 0; i < vdev->pdev.msix_entries_nr; i++) {
+            msix_clr_pending(&vdev->pdev, i);
+            clear_bit(i, vdev->msix->pending);
+        }
+        memory_region_set_enabled(&vdev->pdev.msix_pba_mmio, false);
+    }
+}
+
+/*
+ * BQL-held, with no synchronous VFIO RPC: the daemon must remain able to serve
+ * an in-flight guest access while cancellation waits for this main-loop turn.
+ * Only undelivered signals are canceled, never already injected guest IRQs.
+ */
+static void vfio_user_irq_clear(void *opaque)
+{
+    VFIOUserPCIDevice *udev = opaque;
+    uint8_t packet[9];
+    uint64_t serial;
+    ssize_t count;
+
+    count = recv(udev->irq_clear_fd, packet, sizeof(packet), MSG_DONTWAIT);
+    if (count < 0 && (errno == EAGAIN || errno == EINTR)) {
+        return;
+    }
+    if (count != sizeof(uint64_t)) {
+        vfio_user_irq_clear_close(udev);
+        return;
+    }
+    serial = ldq_le_p(packet);
+    if (!serial || serial <= udev->irq_clear_serial) {
+        vfio_user_irq_clear_close(udev);
+        return;
+    }
+    vfio_user_clear_pending_vectors(&udev->device);
+    udev->irq_clear_serial = serial;
+    count = send(udev->irq_clear_fd, packet, sizeof(uint64_t),
+                 MSG_DONTWAIT | MSG_NOSIGNAL);
+    if (count != sizeof(uint64_t)) {
+        vfio_user_irq_clear_close(udev);
+    }
+}
 
 /*
  * The server maintains the device's pending interrupts,
@@ -279,6 +350,8 @@ static void vfio_user_pci_realize(PCIDevice *pdev, Error **errp)
     if (!vfio_user_validate_version(proxy, errp)) {
         goto error;
     }
+    udev->irq_clear_fd = proxy->irq_clear_fd;
+    proxy->irq_clear_fd = -1;
 
     /*
      * Use socket-based device I/O instead of vfio kernel driver.
@@ -331,12 +404,18 @@ static void vfio_user_pci_realize(PCIDevice *pdev, Error **errp)
     vfio_pci_register_err_notifier(vdev);
     vfio_pci_register_req_notifier(vdev);
 
+    if (udev->irq_clear_fd >= 0) {
+        qemu_set_fd_handler(udev->irq_clear_fd, vfio_user_irq_clear,
+                            NULL, udev);
+    }
+
     return;
 
 out_teardown:
     vfio_pci_teardown_msi(vdev);
     vfio_pci_bars_exit(vdev);
 error:
+    vfio_user_irq_clear_close(udev);
     error_prepend(errp, VFIO_MSG_PREFIX, vdev->vbasedev.name);
     vfio_pci_put_device(vdev);
 }
@@ -346,6 +425,8 @@ static void vfio_user_instance_init(Object *obj)
     PCIDevice *pci_dev = PCI_DEVICE(obj);
     VFIOPCIDevice *vdev = VFIO_PCI_BASE(obj);
     VFIODevice *vbasedev = &vdev->vbasedev;
+
+    VFIO_USER_PCI(obj)->irq_clear_fd = -1;
 
     device_add_bootindex_property(obj, &vdev->bootindex,
                                   "bootindex", NULL,
@@ -372,6 +453,8 @@ static void vfio_user_instance_finalize(Object *obj)
     VFIOPCIDevice *vdev = VFIO_PCI_BASE(obj);
     VFIODevice *vbasedev = &vdev->vbasedev;
 
+    vfio_user_irq_clear_close(VFIO_USER_PCI(obj));
+
     if (vdev->msix != NULL) {
         vfio_user_msix_teardown(vdev);
     }
@@ -393,8 +476,29 @@ static void vfio_user_pci_reset(DeviceState *dev)
     if (vbasedev->reset_works) {
         vfio_user_device_reset(vbasedev->proxy);
     }
+    vfio_user_clear_pending_vectors(vdev);
 
     vfio_pci_post_reset(vdev);
+}
+
+static void vfio_user_write_config(PCIDevice *pdev, uint32_t addr,
+                                   uint32_t val, int len)
+{
+    unsigned cap = pci_find_capability(pdev, PCI_CAP_ID_EXP);
+    unsigned flr_byte = cap + PCI_EXP_DEVCTL + 1;
+    bool flr = cap && range_covers_byte(addr, len, flr_byte) &&
+               ((val >> ((flr_byte - addr) * 8)) &
+                (PCI_EXP_DEVCTL_BCR_FLR >> 8));
+
+    vfio_pci_write_config(pdev, addr, val, len);
+    if (flr) {
+        /*
+         * A forwarded config-space FLR does not invoke the QEMU device reset
+         * callback. Cancel client state after the server has stopped new IRQs,
+         * before the guest can unmask/restore its saved configuration.
+         */
+        vfio_user_clear_pending_vectors(VFIO_PCI_BASE(pdev));
+    }
 }
 
 static const Property vfio_user_pci_dev_properties[] = {
@@ -458,6 +562,7 @@ static void vfio_user_pci_dev_class_init(ObjectClass *klass, const void *data)
 
     dc->desc = "VFIO over socket PCI device assignment";
     pdc->realize = vfio_user_pci_realize;
+    pdc->config_write = vfio_user_write_config;
 }
 
 static const TypeInfo vfio_user_pci_dev_info = {

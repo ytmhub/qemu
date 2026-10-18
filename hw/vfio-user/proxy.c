@@ -892,6 +892,7 @@ VFIOUserProxy *vfio_user_connect_dev(SocketAddress *addr, Error **errp)
     qio_channel_set_blocking(ioc, false, NULL);
 
     proxy = g_malloc0(sizeof(VFIOUserProxy));
+    proxy->irq_clear_fd = -1;
     proxy->sockname = g_strdup_printf("unix:%s", sockname);
     proxy->ioc = ioc;
 
@@ -1000,6 +1001,9 @@ void vfio_user_disconnect(VFIOUserProxy *proxy)
         vfio_user_iothread = NULL;
     }
 
+    if (proxy->irq_clear_fd >= 0) {
+        close(proxy->irq_clear_fd);
+    }
     g_free(proxy->sockname);
     g_free(proxy);
 }
@@ -1183,6 +1187,21 @@ static bool check_multi(VFIOUserProxy *proxy, QObject *qobj, Error **errp)
     return true;
 }
 
+static bool check_irq_clear(VFIOUserProxy *proxy, QObject *qobj, Error **errp)
+{
+    QDict *dict = qobject_to(QDict, qobj);
+    QNum *number = dict ? qobject_to(QNum, qdict_get(dict, "fd_index")) : NULL;
+    uint64_t index;
+
+    /* This client requests no other VERSION descriptors. */
+    if (!number || !qnum_get_try_uint(number, &index) || index != 0) {
+        error_setg(errp, "malformed %s", VFIO_USER_CAP_IRQ_CLEAR);
+        return false;
+    }
+    proxy->irq_clear_supported = true;
+    return true;
+}
+
 static struct cap_entry caps_cap[] = {
     { VFIO_USER_CAP_MAX_FDS, check_max_fds },
     { VFIO_USER_CAP_MAX_XFER, check_max_xfer },
@@ -1190,6 +1209,7 @@ static struct cap_entry caps_cap[] = {
     { VFIO_USER_CAP_MAP_MAX, check_max_dma },
     { VFIO_USER_CAP_MIGR, check_migr },
     { VFIO_USER_CAP_MULTI, check_multi },
+    { VFIO_USER_CAP_IRQ_CLEAR, check_irq_clear },
     { NULL }
 };
 
@@ -1249,6 +1269,7 @@ static GString *caps_json(void)
     qdict_put_int(capdict, VFIO_USER_CAP_PGSIZES, VFIO_USER_DEF_PGSIZE);
     qdict_put_int(capdict, VFIO_USER_CAP_MAP_MAX, VFIO_USER_DEF_MAP_MAX);
     qdict_put_bool(capdict, VFIO_USER_CAP_MULTI, true);
+    qdict_put_bool(capdict, VFIO_USER_CAP_IRQ_CLEAR, true);
 
     qdict_put_obj(dict, VFIO_USER_CAP, QOBJECT(capdict));
 
@@ -1263,6 +1284,9 @@ bool vfio_user_validate_version(VFIOUserProxy *proxy, Error **errp)
     GString *caps;
     char *reply;
     int size, caplen;
+    int channel = -1;
+    VFIOUserFDs fds = { .recv_fds = 1, .fds = &channel };
+    bool sent;
 
     caps = caps_json();
     caplen = caps->len + 1;
@@ -1276,7 +1300,9 @@ bool vfio_user_validate_version(VFIOUserProxy *proxy, Error **errp)
     g_string_free(caps, true);
     trace_vfio_user_version(msgp->major, msgp->minor, msgp->capabilities);
 
-    if (!vfio_user_send_wait(proxy, &msgp->hdr, NULL, 0, errp)) {
+    sent = vfio_user_send_wait(proxy, &msgp->hdr, &fds, 0, errp);
+    proxy->irq_clear_fd = channel;
+    if (!sent) {
         return false;
     }
 
@@ -1298,6 +1324,10 @@ bool vfio_user_validate_version(VFIOUserProxy *proxy, Error **errp)
     }
 
     if (!caps_check(proxy, msgp->minor, reply, errp)) {
+        return false;
+    }
+    if (proxy->irq_clear_supported != (channel >= 0)) {
+        error_setg(errp, "inconsistent %s descriptor", VFIO_USER_CAP_IRQ_CLEAR);
         return false;
     }
 
